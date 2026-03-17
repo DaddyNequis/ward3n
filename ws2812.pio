@@ -1,0 +1,50 @@
+;
+; ws2812.pio — WS2812 / NeoPixel PIO program for RP2040
+;
+; Timing (at 10 cycles per bit, clock divider set for 800 kHz bit rate):
+;   T0H = 3 cycles, T0L = 7 cycles  → 0 bit
+;   T1H = 7 cycles, T1L = 3 cycles  → 1 bit
+;
+; Data format: 24-bit GRB, MSB first.
+; The program shifts data from the TX FIFO 24 bits at a time (left-shifted).
+; The host writes 0xGGRRBB00 left-aligned in a 32-bit word.
+;
+
+.program ws2812
+.side_set 1
+
+.wrap_target
+bitloop:
+    out x, 1        side 0  [2]   ; Stall until data bit available; T0L high + drive low
+    jmp !x do_zero  side 1  [1]   ; Branch on bit; raise pin
+do_one:
+    jmp bitloop     side 1  [4]   ; 1-bit: hold high for T1H (7 cyc total)
+do_zero:
+    nop             side 0  [2]   ; 0-bit: pull low after T0H (3 cyc)
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+/**
+ * Initialise the WS2812 PIO program on the given PIO, state machine, and GPIO pin.
+ * Set freq to 800000 for standard NeoPixels.
+ */
+static inline void ws2812_program_init(PIO pio, uint sm, uint offset,
+                                       uint pin, float freq)
+{
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+
+    pio_sm_config c = ws2812_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_out_shift(&c, false, true, 24); /* shift left, auto-pull, 24 bits */
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    float div = (float)clock_get_hz(clk_sys) / (10.0f * freq);
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

@@ -1,0 +1,8 @@
+build/
+*.uf2
+*.bin
+*.elf
+*.map
+*.hex
+tools/private_key.pem
+tools/cert.pem
