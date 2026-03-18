@@ -146,14 +146,17 @@ Reference: USB Smart Card Device Class (CCID) Specification v1.1.
 | RDR → PC | `RDR_to_PC_DataBlock` | `0x80` | `ccid.c` | Return APDU response or ATR |
 | RDR → PC | `RDR_to_PC_SlotStatus` | `0x81` | `ccid.c` | Return slot state |
 
-**ATR returned on IccPowerOn:** `3B 00` — direct convention, no historical bytes. Minimal valid ATR; CCID short-APDU exchange makes the ATR content non-critical. _(Pending validation — see §8)_
+**ATR returned on IccPowerOn:** `3B 00` — direct convention, no historical bytes. With APDU-level exchange (`dwFeatures=0x00040000`) macOS does not attempt T=0/T=1 protocol negotiation, so the ATR content is non-critical. _(Pending validation — see §8)_
 
-**dwFeatures** in the CCID descriptor: `0x000204B0` — matches YubiKey 5 and is known-good with the macOS CCID driver:
-- `0x00000010` AUTO_CLOCK_FREQ
-- `0x00000020` AUTO_BAUD_RATE
-- `0x00000080` AUTO_PPS
-- `0x00000400` AUTO_IFSD (T=1)
-- `0x00020000` SHORT_APDU_EXCHANGE
+**dwFeatures** in the CCID descriptor: `0x00040000` — Short and Extended APDU level exchange.
+
+The firmware handles raw APDUs directly in `XfrBlock` without T=0/T=1 framing. Declaring APDU-level exchange tells `usbsmartcardreaderd` to pass complete APDUs to the card rather than attempting protocol negotiation — which would fail with the minimal `3B 00` ATR.
+
+> **Why not `0x000204B0` (YubiKey 5 value)?**
+> YubiKey 5 declares TPDU-level exchange (`0x00020000`) with a rich ATR that explicitly advertises T=1.
+> With `ATR=3B 00` (T=0 default, no TD1 byte), macOS rejects the TPDU protocol negotiation with:
+> _"does not support suggested protocol"_.
+> APDU-level exchange bypasses protocol negotiation entirely.
 
 ---
 
@@ -237,10 +240,10 @@ ward3n/
 |---|---|
 | Board | RP2040 Zero (Waveshare) |
 | NeoPixel | Onboard WS2812, GPIO 16 |
-| Button | External tactile switch: one leg to GPIO 23, other leg to GND |
+| Button | External tactile switch: one leg to GPIO 9, other leg to GND |
 | USB | Onboard USB connector (native RP2040 USB FS) |
 
-**Button wiring:** GPIO 23 is configured with the internal pull-up. Press connects it to GND (active-low). No external resistor needed.
+**Button wiring:** GPIO 9 is configured with the internal pull-up. Press connects it to GND (active-low). No external resistor needed.
 
 ---
 
@@ -296,48 +299,75 @@ SRAM  used : 34 KB BSS + 48 KB heap + 4 KB stack ≈ 86 KB / 264 KB
 
 ## 8 — Testing plan for macOS
 
+### macOS version notes
+
+| macOS version | Smart card daemon | Notes |
+|---|---|---|
+| macOS 14 Sonoma and earlier | `pcscd` | `sudo launchctl load /System/Library/LaunchDaemons/com.apple.pcscd.plist` |
+| macOS 15 Sequoia | Transition | `pcscd` may be missing; CTK takes over |
+| **macOS 26 and later** | **CryptoTokenKit only** | `pcscd` is gone. `usbsmartcardreaderd` + `ctkd` handle CCID directly. No manual daemon start needed. |
+
+On macOS 26 + the firmware enumerates, CTK loads automatically, and `security list-smartcards` replaces `pcsctest`.
+
 ### Prerequisites
 
-```bash
-brew install opensc pcsc-lite
-
-# Ensure pcscd is running
-sudo launchctl load /System/Library/LaunchDaemons/com.apple.pcscd.plist
+```zsh
+brew install opensc   # for opensc-tool APDU testing (links against macOS PCSC framework)
 ```
 
 ---
 
 ### Step 1 — USB enumeration
 
-```bash
+Plug in the RP2040 **without** holding BOOT. Wait ~5 s on first boot (key generation).
+
+```zsh
 system_profiler SPUSBDataType | grep -A 12 "PIV Security Key"
 ```
 
-Expected output:
+Expected:
 ```
 PIV Security Key:
   Product ID: 0x0001
   Vendor ID:  0x1209  (pid.codes)
-  Version:    1.00
-  Serial:     00000001
   Speed:      Up to 12 Mb/s
   Manufacturer: ward3n
-  Location ID: 0x…
-  Current Available (mA): 500
-  Current Required (mA):  100
-  Extra Operating Current (mA): 0
 ```
 
-**Pass criterion:** Device appears with class `0x0b` (Smart Card) in `ioreg -p IOUSB -l`.
+NeoPixel should be **dim blue** (IDLE). If it is **red**, key generation is still running — wait a few more seconds.
+
+**Pass criterion:** Device appears in `system_profiler`.
 
 ---
 
-### Step 2 — CCID / PC/SC detection
+### Step 2 — CryptoTokenKit detection (macOS 15+)
 
-```bash
+```zsh
+security list-smartcards
+```
+
+Expected:
+```
+com.apple.setoken: ...
+slot: ward3n PIV Security Key
+```
+
+**Diagnostic — if not found:**
+```zsh
+# Watch CTK logs while replugging the device
+log stream --predicate 'process == "usbsmartcardreaderd" OR process == "ctkd"' --info
+```
+
+Look for `card inserted` followed by `token inserted`. Any `Error` lines indicate the failure reason.
+
+**Pass criterion:** Reader and card slot listed without errors.
+
+---
+
+### Step 2b — CCID detection (macOS 14 and earlier, or with OpenSC)
+
+```zsh
 opensc-tool --list-readers
-# or
-pcsctest
 ```
 
 Expected:
@@ -345,47 +375,64 @@ Expected:
 0: ward3n PIV Security Key [Slot 0]
 ```
 
-**Pass criterion:** Reader listed, card present (`atr=3B00` or similar).
-
 ---
 
 ### Step 3 — Raw APDU smoke test (no crypto required)
 
-```bash
-# Select PIV AID
-opensc-tool --send-apdu 00A404000BA000000308000010000100
-# Expected: 61 13 ... 90 00  (FCI returned, SW=9000)
+> **Important:** each `opensc-tool` invocation opens a new card connection.
+> `piv_init()` is called on every `IccPowerOn`, so `_piv.selected` resets to
+> false each time. Always SELECT PIV AID first **in the same invocation** using
+> multiple `-s` flags (one connection, multiple APDUs in order).
 
-# GET DATA: Card Capability Container
-opensc-tool --send-apdu 00CB3FFF055C035FC107
-# Expected: 53 33 ... 90 00
+```zsh
+# SELECT + GET DATA: Card Capability Container (one connection)
+opensc-tool \
+  -s 00A404000BA000000308000010000100 \
+  -s 00CB3FFF055C035FC107
+# Expected: SELECT → 61 11 ... 90 00, CCC → 53 33 ... 90 00
 
-# GET DATA: CHUID
-opensc-tool --send-apdu 00CB3FFF055C035FC102
-# Expected: 53 3B ... 90 00  (contains GUID at offset ~28)
+# SELECT + GET DATA: CHUID
+opensc-tool \
+  -s 00A404000BA000000308000010000100 \
+  -s 00CB3FFF055C035FC102
+# Expected: SELECT → 90 00, CHUID → 53 3B ... 90 00
 
-# VERIFY PIN "123456" padded to 8 bytes with 0xFF
-opensc-tool --send-apdu 0020008008313233343536FFFF
-# Expected: 90 00
+# SELECT + VERIFY PIN "123456" (padded to 8 bytes with 0xFF)
+opensc-tool \
+  -s 00A404000BA000000308000010000100 \
+  -s 0020008008313233343536FFFF
+# Expected: SELECT → 90 00, VERIFY → 90 00
 
-# Retry counter (no data sent)
-opensc-tool --send-apdu 002000800000
-# Expected: 63 C3  (3 retries remaining)
+# Query retry counter (SELECT first, then VERIFY with no data)
+opensc-tool \
+  -s 00A404000BA000000308000010000100 \
+  -s 002000800000
+# Expected: SELECT → 90 00, retry counter → 63 C3
 ```
+
+**Pass criterion:** All PIV commands return `90 00` (or `63 Cx` for the retry query).
 
 ---
 
 ### Step 4 — Certificate retrieval
 
-```bash
-# GET DATA: PIV Auth certificate (slot 9A)
-opensc-tool --send-apdu 00CB3FFF055C035FC105
-# If cert > Le bytes: SW=61xx → issue GET RESPONSE
-opensc-tool --send-apdu 00C0000000
-# Repeat GET RESPONSE until SW=9000
+```zsh
+# SELECT + GET DATA cert 9A
+# The cert object is typically 350-500 bytes — piv.c returns SW=61xx (ISO 7816 chaining)
+# when the response exceeds Le (default 256 bytes).  Each follow-up GET RESPONSE
+# sends the next chunk; repeat until you see SW=90 00.
+opensc-tool \
+  -s 00A404000BA000000308000010000100 \
+  -s 00CB3FFF055C035FC10500 \
+  -s 00C0000000 \
+  -s 00C0000000
+# → Collect the hex bytes from all Received lines (excluding the trailing 90 00)
+#   and concatenate them; that is the full PIV Data Object (tag 53 … ).
+#   Strip the outer 53/70 TLV wrappers to get the raw DER certificate bytes.
 
-# Parse the DER certificate bytes manually, or use piv-tool:
-piv-tool --reader 0 --read-certificate 9a > /tmp/cert_9a.der 2>/dev/null
+# Alternatively, extract via macOS CTK (already read the cert during card init):
+security find-certificate -a -p 2>/dev/null | \
+  openssl x509 -noout -text 2>/dev/null | head -40
 openssl x509 -inform DER -in /tmp/cert_9a.der -text -noout
 ```
 
@@ -398,51 +445,74 @@ KeyUsage: Digital Signature
 ExtKeyUsage: TLS Web Client Authentication
 ```
 
+**Pass criterion:** Valid DER certificate, P-256 key, correct EKU.
+
 ---
 
 ### Step 5 — GENERAL AUTHENTICATE (ECDSA sign — requires button press)
 
-```bash
-# First call: PIN must already be verified (Step 3 above)
-# Send GENERAL AUTHENTICATE with a 32-byte fake SHA-256 hash:
-opensc-tool --send-apdu 00871190257C238200812031323334353637383930313233343536373839303132
-#                                                  ^^^^ 32 bytes of "12345..."
+The FSM returns `6985` (Conditions Not Satisfied) if no button press has been consumed. The host must retry after the button press.
 
-# Expected on first call (button not pressed): 69 85
-# NeoPixel turns YELLOW — press the button within 30 s
-# Re-send the same APDU:
-opensc-tool --send-apdu 00871190257C238200812031323334353637383930313233343536373839303132
+The device state (authorized) persists across connections; only PIV session state
+(selected, pin_verified) resets on each new connection. The test therefore uses
+two separate `opensc-tool` calls — the button is pressed between them.
 
-# Expected: 7C [len] 82 [sig_len] [DER ECDSA signature] 90 00
-# NeoPixel blinks GREEN during signing, returns to BLUE after
+**APDU breakdown for GENERAL AUTHENTICATE:**
+```
+00 87 11 9A 26   CLA INS P1=alg(ECDSA-P256) P2=keyref(9A) Lc=0x26(38 bytes)
+7C 24            Dynamic Authentication Template, inner length 0x24=36
+  82 00          RESPONSE placeholder (empty = "please sign")
+  81 20          CHALLENGE, length=0x20=32 bytes follow
+  31 32 33 34 35 36 37 38 39 30   "1234567890"  ─┐
+  31 32 33 34 35 36 37 38 39 30   "1234567890"   ├─ 32 bytes SHA-256 hash
+  31 32 33 34 35 36 37 38 39 30   "1234567890"   │  (ASCII "12345678901234567890123456789012")
+  31 32                           "12"          ─┘
 ```
 
-Verify the signature offline:
-```bash
-# Extract public key from cert
+```zsh
+# Call 1: SELECT + VERIFY + GENERAL AUTHENTICATE
+# Expected: SELECT→9000, VERIFY→9000, GENERAL AUTH→6985 (button not pressed yet)
+# NeoPixel turns YELLOW — waiting for button press (30 s window)
+opensc-tool \
+  -s 00A404000BA000000308000010000100 \
+  -s 0020008008313233343536FFFF \
+  -s 0087119A267C24820081203132333435363738393031323334353637383930313233343536373839303132
+
+# *** Press the physical button (GPIO 9 → GND) ***
+# NeoPixel turns GREEN (authorized, 10 s window)
+
+# Call 2: SELECT + VERIFY + GENERAL AUTHENTICATE (same APDU, new connection)
+# Expected: SELECT→9000, VERIFY→9000, GENERAL AUTH→7C [len] 82 [sig] 9000
+opensc-tool \
+  -s 00A404000BA000000308000010000100 \
+  -s 0020008008313233343536FFFF \
+  -s 0087119A267C24820081203132333435363738393031323334353637383930313233343536373839303132
+```
+
+**Offline signature verification:**
+```zsh
 openssl x509 -inform DER -in /tmp/cert_9a.der -pubkey -noout > /tmp/pubkey.pem
 
-# The "hash" we sent was ASCII bytes of "12345678901234567890123456789012"
+# The 32-byte hash above is ASCII "12345678901234567890123456789012"
 echo -n "12345678901234567890123456789012" > /tmp/hash.bin
 
-# Extract the DER signature bytes from the APDU response, save as sig.der
-# Then verify:
+# Extract raw DER signature bytes from the APDU response body (after 7C xx 82 xx)
+# and save as /tmp/sig.der, then:
 openssl dgst -sha256 -verify /tmp/pubkey.pem -signature /tmp/sig.der /tmp/hash.bin
 # Expected: Verified OK
 ```
+
+**Pass criterion:** `openssl dgst` returns `Verified OK`.
 
 ---
 
 ### Step 6 — macOS smart card pairing
 
-```bash
-# List available smart cards
-sc_auth list
+```zsh
+# Confirm CryptoTokenKit sees the card identities
+sc_auth identities
 
-# Open the pairing UI (macOS Ventura+)
-sc_auth pairing_ui
-
-# Or pair manually via certificate hash:
+# Pair the card certificate to your user account
 HASH=$(openssl x509 -inform DER -in /tmp/cert_9a.der -fingerprint -sha1 -noout \
        | sed 's/SHA1 Fingerprint=//' | tr -d ':')
 sc_auth pair -d -u "$USER" -h "$HASH"
@@ -451,32 +521,42 @@ sc_auth pair -d -u "$USER" -h "$HASH"
 sc_auth list -u "$USER"
 ```
 
+**Pass criterion:** `sc_auth list` shows the certificate hash paired to your account.
+
 ---
 
 ### Step 7 — Full macOS authentication flow
 
 1. Lock the screen (`Ctrl+Cmd+Q`).
-2. At the login window, select **Smart Card** (or wait — macOS detects it automatically if paired).
+2. At the login window, select **Smart Card** (macOS detects it automatically if paired).
 3. Enter PIN: `123456`
-4. macOS sends GENERAL AUTHENTICATE to the card. The NeoPixel turns **yellow**.
+4. macOS sends GENERAL AUTHENTICATE. The NeoPixel turns **yellow**.
 5. Press the button within 30 seconds. The NeoPixel turns **green**.
 6. Signing completes. The NeoPixel blinks **green** briefly, then returns to **blue**.
 7. macOS verifies the signature and unlocks.
 
+**Pass criterion:** Screen unlocks without password.
+
 ---
 
-### Step 8 — OpenSC PIV tool (comprehensive test)
+### Step 8 — Diagnosing CTK failures (macOS 15+)
 
-```bash
-# Full PIV card dump (reads all data objects and certificates)
-piv-tool --reader 0 -P 313233343536FFFF --list-keys
+If Step 2 fails, stream logs while replugging:
 
-# Or use OpenSC's pkcs11 tool:
-pkcs11-tool --module /usr/local/lib/opensc-pkcs11.so --list-objects
-pkcs11-tool --module /usr/local/lib/opensc-pkcs11.so \
-    --sign --mechanism ECDSA --input-file /tmp/hash.bin \
-    --output-file /tmp/sig.bin
+```zsh
+log stream \
+  --predicate 'process == "usbsmartcardreaderd" OR process == "ctkd"' \
+  --info
 ```
+
+| Log message | Meaning | Fix |
+|---|---|---|
+| `new device skipped: 0x1209/0x0001` | ifdreader is declining the device; CTK will retry | Usually transient — check next message |
+| `card inserted` | CTK found the reader and ICC | Good — keep reading |
+| `does not support suggested protocol` | dwFeatures/ATR mismatch | Should not occur with `dwFeatures=0x00040000` |
+| `No token driver found for card` | PIV plugin didn't load | CTK can't identify card as PIV — check APDU routing |
+| `failed to set protocol for the card` | Protocol negotiation failed | Same as above |
+| `token inserted` + no error | **Success** | Proceed to `security list-smartcards` |
 
 ---
 
@@ -485,14 +565,14 @@ pkcs11-tool --module /usr/local/lib/opensc-pkcs11.so \
 | # | Item | Status | Detail |
 |---|---|---|---|
 | 1 | USB VID/PID `1209:0001` | **PENDING** | `0x1209` is the pid.codes open-source VID; `0x0001` is unassigned. [Register a PID](https://pid.codes) before production. |
-| 2 | ATR `3B 00` | **PENDING** | Minimal valid ATR. If macOS CCID driver rejects it, replace with: `3B DA 18 FF 81 B1 FE 75 1F 03 00 31 C5 73 C0 01 40 00 90 00` (a real PIV card ATR). |
-| 3 | `dwFeatures = 0x000204B0` | VALIDATED | Matches YubiKey 5; known-good with macOS CCID driver. |
+| 2 | ATR `3B 00` | **PENDING** | Minimal valid ATR. With `dwFeatures=0x00040000` (APDU-level) macOS does not negotiate T=0/T=1 from the ATR. If a richer ATR is needed, try: `3B DA 18 FF 81 B1 FE 75 1F 03 00 31 C5 73 C0 01 40 00 90 00`. |
+| 3 | `dwFeatures = 0x00040000` | **UPDATED** | Changed from `0x000204B0` (TPDU-level, matches YubiKey 5) after live testing on macOS 26: TPDU-level caused `usbsmartcardreaderd` to attempt T=0/T=1 protocol negotiation, which failed against ATR `3B 00`. APDU-level exchange (`0x00040000`) bypasses protocol negotiation — macOS passes raw APDUs directly. |
 | 4 | GENERAL AUTHENTICATE retry on SW=6985 | **PENDING** | macOS CryptoTokenKit is expected to retry when the user dismisses/retries the PIN prompt. If it does not, implement CCID time extensions (CCID spec §5.3) — the card holds the USB response until the button is pressed, similar to YubiKey behaviour. |
 | 5 | mbedTLS X.509 cert in flash | VALIDATED | Generated at first boot; survives power cycles. Flash erase happens before `tusb_init()` — no USB conflict. |
 | 6 | Heap usage during first boot | **PENDING** | mbedTLS x509write is heap-intensive. `PICO_HEAP_SIZE=49152` (48 KB) is provisioned. Validate with heap watermark instrumentation if crashes occur on first boot. |
 | 7 | PIN management | **PENDING** | PIN is hardcoded as `"123456"` in `config.h`. A production implementation must store a PIN hash (PBKDF2-HMAC-SHA256) in flash and implement retry count / lockout. |
 | 8 | Private key in flash | **PENDING** | The P-256 private key scalar is stored in flash as plaintext. This is acceptable for a prototype without a secure element. Replace `crypto_backend_soft.c` with `crypto_backend_se.c` targeting SE050 / ATECC608B for production. |
-| 9 | Button GPIO 23 | **USER CONFIG** | Change `BUTTON_PIN` in `include/config.h` to match your wiring. Any RP2040 GPIO works. |
+| 9 | Button GPIO 9 | **USER CONFIG** | Change `BUTTON_PIN` in `include/config.h` to match your wiring. Any RP2040 GPIO works. |
 | 10 | Self-signed cert macOS trust | **PENDING** | macOS will not trust the self-signed cert for login without either (a) it being in the System keychain, or (b) the user account being paired via `sc_auth`. For testing, pairing via `sc_auth pair` is sufficient. |
 | 11 | PIV PIN reference 80 only | **PENDING** | Only application PIN (ref `0x80`) is implemented. Global PIN (ref `0x00`) and PUK are not implemented. Some macOS versions may probe for PUK; return `SW_REFERENCED_DATA_NOT_FOUND` (0x6A88). |
 | 12 | Homebrew `arm-none-eabi-gcc` | NOT SUPPORTED | Built `--without-headers`; missing `nosys.specs` / newlib. Use the [official ARM GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) extracted to `~/arm-toolchain`. |

@@ -56,13 +56,12 @@ static const tusb_desc_device_t desc_device = {
 /* CCID functional descriptor (CCID spec v1.1, section 5.1) */
 #define CCID_DESCRIPTOR_TYPE 0x21u
 
-/* dwFeatures = 0x000204B0:
- *   0x00000010  AUTO_CLOCK_FREQ (automatic ICC clock frequency change)
- *   0x00000020  AUTO_BAUD_RATE
- *   0x00000080  AUTO_PPS (automatic PPS made by CCID)
- *   0x00000400  AUTO_IFSD (automatic IFSD exchange, T=1)
- *   0x00020000  SHORT_APDU_EXCHANGE
- * This combination is used by YubiKey 5 and is known-good with macOS.
+/* dwFeatures = 0x00040000:
+ *   Short and Extended APDU level exchange (bit 18).
+ *   macOS usbsmartcardreaderd sends complete APDUs in XfrBlock abData
+ *   without T=0/T=1 TPDU framing — which is exactly what this firmware
+ *   implements.  Using TPDU-level (0x00020000) causes macOS to attempt
+ *   protocol negotiation against the ATR, which fails with ATR 3B 00.
  */
 static const uint8_t desc_configuration[CONFIG_TOTAL_LEN] = {
     /* ── Config descriptor (9) ─────────────────────────────────────────────── */
@@ -92,7 +91,7 @@ static const uint8_t desc_configuration[CONFIG_TOTAL_LEN] = {
     U16_TO_U8S_LE(0x0110),                       /* bcdCCID 1.10                 */
     0x00,                                        /* bMaxSlotIndex (0 = 1 slot)   */
     0x07,                                        /* bVoltageSupport: 5V/3V/1.8V  */
-    U32_TO_U8S_LE(0x00000002),                   /* dwProtocols: T=1             */
+    U32_TO_U8S_LE(0x00000003),                   /* dwProtocols: T=0 + T=1       */
     U32_TO_U8S_LE(0x00000DFC),                   /* dwDefaultClock: 3580 kHz     */
     U32_TO_U8S_LE(0x00000DFC),                   /* dwMaximumClock               */
     0x00,                                        /* bNumClockSupported (0=default)*/
@@ -102,7 +101,7 @@ static const uint8_t desc_configuration[CONFIG_TOTAL_LEN] = {
     U32_TO_U8S_LE(0x000000FE),                   /* dwMaxIFSD: 254               */
     U32_TO_U8S_LE(0x00000000),                   /* dwSynchProtocols             */
     U32_TO_U8S_LE(0x00000000),                   /* dwMechanical                 */
-    U32_TO_U8S_LE(0x000204B0),                   /* dwFeatures (see above)       */
+    U32_TO_U8S_LE(0x00040000),                   /* dwFeatures (see above)       */
     U32_TO_U8S_LE(0x0000010F),                   /* dwMaxCCIDMessageLength: 271  */
     0xFF,                                        /* bClassGetResponse            */
     0xFF,                                        /* bClassEnvelope               */

@@ -10,7 +10,7 @@
 
 /* ── Hardware pins (RP2040 Zero) ────────────────────────────────────────────── */
 #define NEOPIXEL_PIN        16u   /* Onboard WS2812 on RP2040 Zero            */
-#define BUTTON_PIN          23u   /* User presence button (active-low + pull-up)*/
+#define BUTTON_PIN           9u   /* User presence button (active-low + pull-up)*/
 #define BUTTON_DEBOUNCE_MS  30u   /* Debounce window                           */
 
 /* ── State machine timing ───────────────────────────────────────────────────── */

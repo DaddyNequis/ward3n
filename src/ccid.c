@@ -23,9 +23,15 @@
 static bool _icc_powered = false;   /* true after IccPowerOn, false after Off  */
 
 /* ATR returned on IccPowerOn.
- * 3B 00 = direct convention, no historical bytes.
- * Minimal valid ATR; CCID short-APDU exchange means ATR TA1/TB1 not critical. */
-static const uint8_t _atr[] = { 0x3B, 0x00 };
+ * 3B 10 01 11 — direct convention, minimal T=1 ATR:
+ *   TS   = 3B        direct convention
+ *   T0   = 10        Y1=0001 → TD1 present, K=0 (no historical bytes)
+ *   TD1  = 01        Y2=0000 (no further interface bytes), T=0001 → T=1
+ *   TCK  = 11        XOR of T0..TD1 = 0x10^0x01 = 0x11
+ * Explicitly advertising T=1 matches dwProtocols and tells macOS PCSC
+ * to negotiate T=1 as the active protocol, which is required when
+ * dwFeatures=0x00040000 (APDU-level: reader handles protocol internally). */
+static const uint8_t _atr[] = { 0x3B, 0x10, 0x01, 0x11 };
 
 /* ── Endpoint addresses and transfer buffers ─────────────────────────────────── */
 static uint8_t _ep_out;
@@ -146,8 +152,57 @@ static void _process_message(const uint8_t *msg, size_t msg_len)
         resp_len = _make_slot_status(_tx_buf, seq, CCID_CMD_OK, 0, 0);
         break;
 
+    /* ── SetParameters (0x61) ────────────────────────────────────────────────── */
+    case 0x61: {
+        /* macOS usbsmartcardreaderd sends this unconditionally to negotiate T=1
+         * parameters even for APDU-level readers.  We are APDU-level so the
+         * parameters are irrelevant, but we must echo them back in the correct
+         * RDR_to_PC_Parameters (0x82) format or macOS aborts the connect.     */
+        uint32_t plen = req->dwLength;
+        if (plen > sizeof(_tx_buf) - CCID_HEADER_LEN)
+            plen = 0;
+        ccid_header_t *h = (ccid_header_t *)_tx_buf;
+        h->bMessageType = CCID_RDR_to_PC_Parameters;
+        h->dwLength     = plen;
+        h->bSlot        = 0;
+        h->bSeq         = seq;
+        h->bSpecific_0  = (uint8_t)(CCID_CMD_OK | CCID_ICC_ACTIVE);
+        h->bSpecific_1  = 0;
+        h->bSpecific_2  = req->bSpecific_2;   /* bProtocolNum (0x01 = T=1)    */
+        if (plen > 0 && CCID_HEADER_LEN + plen <= msg_len)
+            memcpy(_tx_buf + CCID_HEADER_LEN, msg + CCID_HEADER_LEN, plen);
+        resp_len = CCID_HEADER_LEN + plen;
+        break;
+    }
+
+    /* ── SetDataRateAndClockFrequency (0x73) ─────────────────────────────────── */
+    case 0x73: {
+        /* macOS also sends this unconditionally.  Echo back whatever it
+         * requested in RDR_to_PC_DataRateAndClockFrequency (0x84).            */
+        ccid_header_t *h = (ccid_header_t *)_tx_buf;
+        h->bMessageType = 0x84;
+        h->dwLength     = 8;
+        h->bSlot        = 0;
+        h->bSeq         = seq;
+        h->bSpecific_0  = (uint8_t)(CCID_CMD_OK | CCID_ICC_ACTIVE);
+        h->bSpecific_1  = 0;
+        h->bSpecific_2  = 0;   /* bRFU */
+        if (req->dwLength >= 8 && CCID_HEADER_LEN + 8 <= msg_len) {
+            /* Echo the requested clock/rate back so macOS sees its own values */
+            memcpy(_tx_buf + CCID_HEADER_LEN, msg + CCID_HEADER_LEN, 8);
+        } else {
+            /* Fallback to descriptor defaults */
+            uint32_t clk  = 0x00000DFCU; /* 3580 kHz */
+            uint32_t rate = 0x000025CDU; /* 9677 bps */
+            memcpy(_tx_buf + CCID_HEADER_LEN,     &clk,  4);
+            memcpy(_tx_buf + CCID_HEADER_LEN + 4, &rate, 4);
+        }
+        resp_len = CCID_HEADER_LEN + 8;
+        break;
+    }
+
     default:
-        /* Unknown command — respond with CMD_FAILED, error 0 */
+        /* Unknown command — respond with CMD_FAILED */
         resp_len = _make_slot_status(_tx_buf, seq, CCID_CMD_FAILED, 0, 0);
         break;
     }
@@ -227,10 +282,25 @@ static uint16_t _ccid_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc
 static bool _ccid_control_xfer_cb(uint8_t rhport, uint8_t stage,
                                    tusb_control_request_t const *request)
 {
-    (void)rhport; (void)stage; (void)request;
-    /* CCID class control requests (e.g., ABORT, GET_CLOCK_FREQUENCIES):
-     * not implemented in this prototype — pending validation */
-    return false;
+    /* Only act on SETUP stage; TinyUSB re-invokes for DATA/ACK automatically */
+    if (stage != CONTROL_STAGE_SETUP) return true;
+
+    if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_CLASS) {
+        switch (request->bRequest) {
+        case 0x62: /* GET_CLOCK_FREQUENCIES — bNumClockSupported=0 → empty  */
+        case 0x63: /* GET_DATA_RATES       — bNumDataRatesSupported=0 → empty */
+            /* Return ZLP; macOS falls back to dwDefaultClock/dwDataRate values
+             * from the CCID functional descriptor.                            */
+            return tud_control_xfer(rhport, request, NULL, 0);
+
+        case 0x61: /* ABORT — acknowledge; bulk-level abort handled separately */
+            return tud_control_xfer(rhport, request, NULL, 0);
+
+        default:
+            break;
+        }
+    }
+    return false; /* STALL unrecognised requests */
 }
 
 static bool _ccid_xfer_cb(uint8_t rhport, uint8_t ep_addr,
