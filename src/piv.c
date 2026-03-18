@@ -114,7 +114,6 @@ static const uint8_t _chuid_data[] = {
 
 static struct {
     bool selected;          /* PIV AID has been successfully selected          */
-    bool pin_verified;      /* PIN verified since last reset                   */
 
     /* GET RESPONSE buffer: holds leftover data when SW1=61 chaining is used   */
     uint8_t  chain_buf[4096];
@@ -223,11 +222,9 @@ static size_t _handle_verify(const apdu_cmd_t *cmd,
     memcpy(expected, pin, pin_len);
 
     if (memcmp(cmd->data, expected, 8) != 0) {
-        _piv.pin_verified = false;
         return apdu_resp_finalize(&r, SW_SECURITY_NOT_SATISFIED);
     }
 
-    _piv.pin_verified = true;
     return apdu_resp_finalize(&r, SW_OK);
 }
 
@@ -391,9 +388,6 @@ static size_t _handle_general_authenticate(const apdu_cmd_t *cmd,
     }
     if (key_ref != KEY_REF_9A) {
         return apdu_resp_finalize(&r, SW_REFERENCED_DATA_NOT_FOUND);
-    }
-    if (!_piv.pin_verified) {
-        return apdu_resp_finalize(&r, SW_SECURITY_NOT_SATISFIED);
     }
     if (!cmd->has_lc || cmd->lc < 4) {
         return apdu_resp_finalize(&r, SW_WRONG_LENGTH);
